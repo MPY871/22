@@ -1,0 +1,115 @@
+name: Signer pour TestFlight
+on:
+  workflow_dispatch:
+    inputs:
+      upload_to_testflight:
+        description: Envoyer aussi cette build à App Store Connect
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: sc4r-testflight
+  cancel-in-progress: false
+defaults:
+  run:
+    working-directory: .source/ios
+jobs:
+  signed:
+    runs-on: macos-26
+    timeout-minutes: 50
+    env:
+      SC4R_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+      SC4R_BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID }}
+      SC4R_BUILD_NUMBER: ${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extraire le projet SwiftUI complet
+        working-directory: .
+        run: unzip -q SC4R-iOS-sources.zip -d .source
+      - name: Vérifier les tests natifs
+        run: bash scripts/build-ios.sh tests
+      - name: Installer les éléments de signature Apple
+        env:
+          SC4R_P12_BASE64: ${{ secrets.IOS_P12_BASE64 }}
+          SC4R_P12_PASSWORD: ${{ secrets.IOS_P12_PASSWORD }}
+          SC4R_PROFILE_BASE64: ${{ secrets.IOS_PROFILE_BASE64 }}
+          SC4R_KEYCHAIN_PASSWORD: ${{ secrets.IOS_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, os, plistlib, subprocess, uuid
+          from pathlib import Path
+          for name in ['SC4R_P12_BASE64','SC4R_P12_PASSWORD','SC4R_PROFILE_BASE64','SC4R_KEYCHAIN_PASSWORD']:
+              if not os.environ.get(name): raise SystemExit('Secret manquant : ' + name)
+          root = Path(os.environ['RUNNER_TEMP'])
+          certificate = root/'sc4r-distribution.p12'
+          certificate.write_bytes(base64.b64decode(os.environ['SC4R_P12_BASE64'], validate=True)); certificate.chmod(0o600)
+          profile = root/'sc4r-profile.mobileprovision'
+          profile.write_bytes(base64.b64decode(os.environ['SC4R_PROFILE_BASE64'], validate=True)); profile.chmod(0o600)
+          decoded = subprocess.check_output(['security','cms','-D','-i',str(profile)])
+          values = plistlib.loads(decoded)
+          uuid.UUID(values['UUID'])
+          target = Path.home()/'Library/MobileDevice/Provisioning Profiles'/(values['UUID']+'.mobileprovision')
+          target.parent.mkdir(parents=True,exist_ok=True); target.write_bytes(profile.read_bytes())
+          readable = root/'sc4r-profile.plist'; readable.write_bytes(decoded); readable.chmod(0o600)
+          if any(character in values['Name'] for character in ['\n','\r']): raise SystemExit('Profil Apple invalide')
+          with open(os.environ['GITHUB_ENV'],'a') as output:
+              output.write('SC4R_PROFILE_PATH='+str(readable)+'\nSC4R_PROFILE_NAME='+values['Name']+'\nSC4R_PROFILE_UUID='+values['UUID']+'\n')
+          PY
+          keychain="$RUNNER_TEMP/sc4r-signing.keychain-db"
+          security create-keychain -p "$SC4R_KEYCHAIN_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$SC4R_KEYCHAIN_PASSWORD" "$keychain"
+          security import "$RUNNER_TEMP/sc4r-distribution.p12" -P "$SC4R_P12_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$SC4R_KEYCHAIN_PASSWORD" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain"
+      - name: Compiler et exporter la build signée
+        run: bash scripts/archive-signed.sh
+      - name: Fournir l’IPA signée
+        uses: actions/upload-artifact@v4
+        with:
+          name: SC4R-signe-AppStoreConnect
+          path: .source/ios/build/signed/SC4R.ipa
+          if-no-files-found: error
+          retention-days: 7
+      - name: Envoyer à TestFlight si demandé
+        if: ${{ inputs.upload_to_testflight }}
+        env:
+          SC4R_ASC_KEY_BASE64: ${{ secrets.ASC_KEY_BASE64 }}
+          SC4R_ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          SC4R_ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, os, re
+          from pathlib import Path
+          key = os.environ.get('SC4R_ASC_KEY_ID',''); issuer = os.environ.get('SC4R_ASC_ISSUER_ID','')
+          if not re.fullmatch(r'[A-Z0-9]{10}',key) or not re.fullmatch(r'[A-Fa-f0-9-]{36}',issuer): raise SystemExit('Identifiants App Store Connect manquants ou invalides')
+          path = Path.home()/'.appstoreconnect/private_keys'/('AuthKey_'+key+'.p8')
+          path.parent.mkdir(parents=True,exist_ok=True)
+          path.write_bytes(base64.b64decode(os.environ['SC4R_ASC_KEY_BASE64'],validate=True));path.chmod(0o600)
+          PY
+          xcrun iTMSTransporter -m upload -assetFile build/signed/SC4R.ipa -apiKey "$SC4R_ASC_KEY_ID" -apiIssuer "$SC4R_ASC_ISSUER_ID"
+      - name: Résultats des tests et journaux
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SC4R-tests-signature
+          path: |
+            .source/ios/build/Tests.xcresult
+            .source/ios/build/*.log
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Effacer les éléments privés du Mac temporaire
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/sc4r-signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/sc4r-distribution.p12" "$RUNNER_TEMP/sc4r-profile.mobileprovision" "$RUNNER_TEMP/sc4r-profile.plist"
+          if [[ -n "${SC4R_PROFILE_UUID:-}" ]]; then rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/$SC4R_PROFILE_UUID.mobileprovision"; fi
+          python3 - <<'PY'
+          from pathlib import Path
+          root = Path.home()/'.appstoreconnect/private_keys'
+          if root.exists():
+              for path in root.glob('AuthKey_*.p8'): path.unlink()
+          PY
